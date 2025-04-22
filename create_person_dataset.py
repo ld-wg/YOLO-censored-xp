@@ -2,6 +2,9 @@ import os
 import shutil
 import kagglehub
 import zipfile
+import fiftyone as fo
+from fiftyone.utils.huggingface import load_from_hub
+from huggingface_hub import snapshot_download
 
 # Kaggle dataset identifier
 KAGGLE_DATASET_ID = "techzizou/labeled-mask-dataset-yolo-darknet"
@@ -91,7 +94,16 @@ def process_crowdhuman_dataset():
     Process the CrowdHuman dataset.
     Conversion from the native format to YOLO format must be implemented.
     """
-    print("Processing CrowdHuman dataset (conversion logic not implemented).")
+    print("Downloading CrowdHuman dataset using Snapshot Download...")
+    # Specify the target directory with local_dir; adjust the path if needed (absolute or relative)
+    dataset_path = snapshot_download(
+        "sshao0516/CrowdHuman",
+        token="****",
+        local_dir="crowdface",
+        repo_type="dataset"
+    )
+    print("Dataset downloaded to:", dataset_path)
+    
 
 def process_openimages_dataset():
     """
