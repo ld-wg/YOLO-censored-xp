@@ -44,7 +44,6 @@ class DatasetPreparer:
             logger.debug(f"Created directory: {dir_path}")
     
     def validate_dataset_pairings(self, image_dir: Path, label_dir: Path) -> bool:
-        """Validate that every image has a corresponding label file and vice versa."""
         valid = True
         
         # Check images -> labels
