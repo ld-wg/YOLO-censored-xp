@@ -1,0 +1,205 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[portuguese]{babel}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{xcolor}
+
+% Configuração para listagens de código
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny,
+    showstringspaces=false,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{purple}
+}
+
+\title{Impacto da Censura de Faces no Desempenho do YOLOv8-nano para Detecção de Pessoas}
+\author{Ludwig Aumann}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Este trabalho investiga o impacto de diferentes métodos de censura facial no desempenho de modelos de detecção de objetos, especificamente o YOLOv8-nano, na tarefa de detecção de pessoas. Utilizando o dataset CrowdHuman, desenvolvemos um pipeline de censura que gera três variantes do conjunto de dados: original (não censurado), faces borradas através de filtro Gaussiano, e faces cobertas por retângulos pretos. O objetivo é avaliar se a privacidade dos indivíduos pode ser preservada sem comprometer significativamente o desempenho do detector, e qual método de censura oferece o melhor equilíbrio entre privacidade e desempenho.
+\end{abstract}
+
+\section{Introdução}
+A detecção de pessoas em imagens é uma tarefa fundamental em visão computacional, com aplicações em segurança, análise de multidões e sistemas de vigilância. Contudo, questões de privacidade surgem quando estas aplicações capturam e processam imagens contendo faces identificáveis. Este trabalho propõe investigar se é possível manter um bom desempenho na detecção de pessoas mesmo quando as faces são deliberadamente censuradas durante o treinamento e inferência, e comparar a eficácia de diferentes métodos de censura.
+
+\section{Metodologia}
+
+\subsection{Estrutura do Projeto}
+O framework desenvolvido segue uma estrutura organizada para facilitar o processamento e comparação das diferentes variantes do dataset. A estrutura base do projeto é:
+
+\begin{lstlisting}[language=bash,caption=Estrutura de Diretórios do Projeto]
+crowdhuman/
+├── annotation.odgt         # Arquivo único de anotações
+├── uncensored/            # Imagens originais
+├── censored-blur/         # Imagens com faces borradas
+└── censored-bbox/         # Imagens com faces cobertas
+
+crowdhuman_yolo/          # Dataset preparado para YOLO
+├── uncensored/
+│   ├── images/
+│   │   ├── train/       # 70% dos dados
+│   │   ├── val/         # 15% dos dados
+│   │   └── test/        # 15% dos dados
+│   └── labels/          # Anotações em formato YOLO
+├── censored-blur/
+│   ├── images/
+│   │   ├── train/
+│   │   └── val/
+│   └── labels/
+└── censored-bbox/
+    ├── images/
+    │   ├── train/
+    │   └── val/
+    └── labels/
+
+runs/                    # Resultados dos experimentos
+├── train/
+│   ├── uncensored_*/
+│   ├── censored-blur_*/
+│   └── censored-bbox_*/
+└── test/
+    ├── uncensored_*_test/
+    ├── censored-blur_*_test/
+    └── censored-bbox_*_test/
+\end{lstlisting}
+
+\subsection{Dataset e Pré-processamento}
+Utilizamos o dataset CrowdHuman, que contém aproximadamente 15.000 imagens com mais de 340.000 instâncias de pessoas anotadas. O dataset fornece anotações detalhadas incluindo bounding boxes para corpos inteiros e cabeças (head bounding boxes), o que facilita a aplicação precisa da censura facial.
+
+\subsubsection{Divisão do Dataset}
+O conjunto de dados é dividido automaticamente em três subconjuntos usando uma semente aleatória fixa (42) para garantir reprodutibilidade:
+
+\begin{itemize}
+    \item \textbf{Treino (70\%):} Utilizado para o treinamento dos modelos
+    \item \textbf{Validação (15\%):} Usado durante o treinamento para monitorar o desempenho e evitar overfitting
+    \item \textbf{Teste (15\%):} Reservado exclusivamente para avaliação final
+\end{itemize}
+
+Esta divisão é mantida consistente para todas as variantes do dataset através do uso da semente aleatória fixa, garantindo uma comparação justa entre os diferentes métodos de censura. O processo de divisão ocorre após a aplicação do parâmetro de fração do dataset (--fraction), que permite executar experimentos preliminares com subconjuntos menores dos dados.
+
+\subsubsection{Formato das Anotações}
+As anotações originais estão no formato ODGT (Object Detection Ground Truth) e são convertidas para o formato YOLO. O processo de conversão inclui:
+
+\begin{itemize}
+    \item Normalização das coordenadas (0-1)
+    \item Conversão de [x, y, width, height] para [x\_center, y\_center, width, height]
+    \item Filtragem de anotações inválidas ou muito pequenas
+    \item Remoção de instâncias marcadas como "ignore"
+\end{itemize}
+
+\subsection{Pipeline de Censura}
+Desenvolvemos um pipeline automatizado de censura que processa o dataset original gerando três variantes:
+
+\begin{enumerate}
+    \item \textbf{Dataset Original (Não Censurado):}
+    \begin{itemize}
+        \item Mantém as imagens originais sem modificação
+        \item Serve como baseline para comparação
+        \item Utilizado para o conjunto de teste de todos os modelos
+    \end{itemize}
+    
+    \item \textbf{Censura por Desfoque (Blur):}
+    \begin{itemize}
+        \item Aplica um filtro Gaussiano com kernel 45x45 nas regiões faciais
+        \item Preserva informações contextuais enquanto anonimiza faces
+        \item Implementado usando OpenCV (cv2.GaussianBlur)
+        \item Mantém a estrutura geral da imagem intacta
+        \item Tamanho do kernel escolhido empiricamente para garantir anonimização efetiva
+    \end{itemize}
+    
+    \item \textbf{Censura por Retângulo Preto (Bbox):}
+    \begin{itemize}
+        \item Substitui completamente a região facial por um retângulo preto
+        \item Remove totalmente a informação visual da face
+        \item Implementado usando OpenCV (cv2.rectangle com preenchimento)
+        \item Representa uma abordagem mais agressiva de censura
+        \item Utiliza cor preta (0, 0, 0) para máxima oclusão
+    \end{itemize}
+\end{enumerate}
+
+O processo de censura utiliza as head bounding boxes fornecidas nas anotações do CrowdHuman (formato ODGT), garantindo precisão na localização das regiões faciais a serem censuradas. Todas as variantes mantêm exatamente os mesmos nomes de arquivo e estrutura de diretórios, facilitando o processamento paralelo e a comparação direta dos resultados.
+
+\subsection{Modelo de Detecção}
+Para os experimentos, utilizamos o YOLOv8-nano, a versão mais compacta do YOLOv8, escolhida por seu equilíbrio entre eficiência computacional e desempenho. O modelo é treinado em três configurações distintas:
+
+\begin{itemize}
+    \item Dataset original (não censurado)
+    \item Dataset com faces borradas (censura por blur)
+    \item Dataset com faces cobertas (censura por bbox)
+\end{itemize}
+
+\subsubsection{Parâmetros de Treinamento}
+Cada configuração utiliza parâmetros idênticos de treinamento:
+\begin{itemize}
+    \item Tamanho de imagem: 640x640 pixels
+    \item Batch size: 8
+    \item Otimizador: AdamW
+    \item Learning rate: auto-ajustável com warm-up
+    \item Data augmentation: desativada para garantir comparação justa
+    \item Early stopping: patience de 7 épocas
+    \item Épocas máximas: 10 (ajustável via parâmetro --epochs)
+    \item Workers: 2 (ajustável via parâmetro --workers)
+    \item Dispositivo: auto-seleção entre CUDA, MPS ou CPU
+\end{itemize}
+
+\subsection{Protocolo de Avaliação}
+Para garantir uma avaliação robusta e imparcial, todos os modelos são avaliados no mesmo conjunto de teste não censurado. Esta abordagem permite:
+
+\begin{itemize}
+    \item Comparação direta do desempenho entre os diferentes métodos de censura
+    \item Avaliação da capacidade de generalização dos modelos
+    \item Mensuração do impacto real da censura no desempenho de detecção
+\end{itemize}
+
+\subsubsection{Métricas de Avaliação}
+As métricas principais de avaliação incluem:
+\begin{itemize}
+    \item mAP50 (mean Average Precision com IoU threshold de 0.5)
+    \item Recall (capacidade de detectar todas as pessoas na imagem)
+    \item Precisão (confiabilidade das detecções)
+    \item F1-score (média harmônica entre precisão e recall)
+    \item Velocidade de inferência (FPS)
+\end{itemize}
+
+\section{Experimentos em Andamento}
+Os experimentos estão em fase de execução, com foco na comparação sistemática do desempenho do YOLOv8-nano nas diferentes variantes do dataset. Além das métricas quantitativas, serão realizadas análises qualitativas das detecções, incluindo:
+
+\begin{itemize}
+    \item Comportamento em cenários de alta densidade de pessoas
+    \item Impacto da censura em casos de oclusão parcial
+    \item Robustez a diferentes condições de iluminação e poses
+    \item Análise de falsos positivos e falsos negativos específicos de cada método
+    \item Avaliação do impacto da censura em diferentes escalas de pessoas
+    \item Análise do desempenho em função da distância da câmera
+    \item Comportamento em cenas internas vs. externas
+\end{itemize}
+
+Os resultados preliminares e análises detalhadas serão apresentados na versão final deste trabalho, incluindo:
+
+\begin{itemize}
+    \item Tabelas comparativas de métricas
+    \item Gráficos de convergência do treinamento
+    \item Exemplos visuais de detecções
+    \item Análise estatística das diferenças de desempenho
+    \item Recomendações práticas para implementação
+\end{itemize}
+
+\end{document} 
