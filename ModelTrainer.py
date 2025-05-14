@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ModelTrainer module for CrowdHuman Dataset Trainer
-# Handles model training for both censored and uncensored datasets
+# Handles model training for uncensored and censored datasets
 
 import os
 import logging
@@ -8,15 +8,14 @@ import traceback
 import torch
 from pathlib import Path
 from ultralytics import YOLO
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 
 from Config import Config
-from DatasetPreparer import DatasetPreparer
 
 logger = logging.getLogger('crowdhuman_trainer')
 
 class ModelTrainer:
-    # model training for both censored and uncensored datasets
+    # model training for uncensored and censored datasets
     
     def __init__(self, config: Config) -> None:
         # initialize trainer with configuration
@@ -37,22 +36,27 @@ class ModelTrainer:
             logger.info("No GPU available. Using CPU.")
             return "cpu"
     
-    def train_models(self, dataset_preparer: DatasetPreparer) -> Dict[str, str]:
-        # train both censored and uncensored models
+    def train_model(
+        self, 
+        train_data: Literal['uncensored', 'censored-bbox', 'censored-blur'],
+        val_data: Literal['uncensored', 'censored-bbox', 'censored-blur'],
+        test_data: Literal['uncensored'] = 'uncensored'
+    ) -> Dict[str, Any]:
+        """Train a single model with specified training, validation and test data."""
         logger.info(f"Starting model training on device: {self.device}")
+        logger.info(f"Training data: {train_data}")
+        logger.info(f"Validation data: {val_data}")
+        logger.info(f"Test data: {test_data}")
         
-        # create YAML configurations
-        yaml_uncensored = Path("data_uncensored.yaml").resolve()
-        yaml_censored = Path("data_censored.yaml").resolve()
+        # create YAML configuration
+        yaml_path = Path(f"data_{train_data}.yaml").resolve()
+        self.create_yaml(yaml_path, train_data, val_data, test_data)
         
-        dataset_preparer.create_yaml(yaml_uncensored, 'uncensored')
-        dataset_preparer.create_yaml(yaml_censored, 'censored')
+        # initialize model
+        experiment_name = self.config.get_experiment_name(train_data)
+        logger.info(f"Training model: {experiment_name}")
         
-        # train uncensored model
-        uncensored_experiment = self.config.get_experiment_name('uncensored')
-        logger.info(f"Training uncensored model: {uncensored_experiment}")
-        
-        model_uncensored = YOLO(self.config.model_name)
+        model = YOLO(self.config.model_name)
         
         try:
             # Clear memory before training
@@ -61,15 +65,16 @@ class ModelTrainer:
             elif torch.backends.mps.is_available():
                 torch.mps.empty_cache()
                 
-            uncensored_results = model_uncensored.train(
-                data=str(yaml_uncensored),
+            # Train model
+            train_results = model.train(
+                data=str(yaml_path),
                 epochs=self.config.epochs,
                 imgsz=self.config.img_size,
                 patience=self.config.patience,
                 batch=self.config.batch_size,
                 workers=0,
                 project="runs/train",
-                name=uncensored_experiment,
+                name=experiment_name,
                 exist_ok=True,
                 device=self.device,
                 amp=False,
@@ -86,66 +91,87 @@ class ModelTrainer:
                 rect=False   # disable rectangular training
             )
             
-            uncensored_model_path = Path("runs/train") / uncensored_experiment / "weights/best.pt"
-            if os.path.exists(uncensored_model_path):
-                logger.info(f"Uncensored model saved at: {uncensored_model_path}")
+            model_path = Path("runs/train") / experiment_name / "weights/best.pt"
+            test_map50 = 0.0
+            
+            if os.path.exists(model_path):
+                logger.info(f"Model saved at: {model_path}")
+                # Evaluate on the test set using uncensored data
+                logger.info(f"Evaluating model on uncensored test set...")
+                try:
+                    # Create test YAML with uncensored test data
+                    test_yaml_path = Path(f"data_test_{train_data}.yaml").resolve()
+                    self.create_yaml(test_yaml_path, train_data, val_data, test_data, test_only=True)
+                    
+                    test_results = model.val(
+                        data=str(test_yaml_path),
+                        split='test',
+                        project="runs/test",
+                        name=f"{experiment_name}_test"
+                    )
+                    test_map50 = test_results.box.map50
+                    logger.info(f"Test set evaluation complete. mAP50: {test_map50:.3f}")
+                except Exception as e_test:
+                    logger.error(f"Error during test set evaluation: {e_test}")
+                    traceback.print_exc()
             else:
-                logger.warning(f"Expected model file not found at {uncensored_model_path}")
+                logger.warning(f"Expected model file not found at {model_path}")
                 
         except Exception as e:
-            logger.error(f"Error during uncensored model training: {e}")
+            logger.error(f"Error during model training: {e}")
             traceback.print_exc()
+            return {'model_path': None, 'test_map50': 0.0}
         
-        # Clear memory between training runs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-            
-        # train censored model
-        censored_experiment = self.config.get_experiment_name('censored')
-        logger.info(f"Training censored model: {censored_experiment}")
-        
-        model_censored = YOLO(self.config.model_name)
-        
-        try:
-            censored_results = model_censored.train(
-                data=str(yaml_censored),
-                epochs=self.config.epochs,
-                imgsz=self.config.img_size,
-                patience=self.config.patience,
-                batch=self.config.batch_size,
-                workers=0,
-                project="runs/train",
-                name=censored_experiment,
-                exist_ok=True,
-                device=self.device,
-                amp=False,
-                mosaic=0.0,  # disable mosaic augmentation
-                mixup=0.0,   # disable mixup augmentation
-                copy_paste=0.0,  # disable copy-paste augmentation
-                fliplr=0.0,  # disable horizontal flips
-                flipud=0.0,  # disable vertical flips
-                degrees=0.0, # disable rotation
-                translate=0.0,  # disable translation
-                scale=0.0,   # disable scaling
-                shear=0.0,   # disable shearing
-                perspective=0.0,  # disable perspective transforms
-                rect=False   # disable rectangular training
-            )
-            
-            censored_model_path = Path("runs/train") / censored_experiment / "weights/best.pt"
-            if os.path.exists(censored_model_path):
-                logger.info(f"Censored model saved at: {censored_model_path}")
-            else:
-                logger.warning(f"Expected model file not found at {censored_model_path}")
-                
-        except Exception as e:
-            logger.error(f"Error during censored model training: {e}")
-            traceback.print_exc()
-        
-        logger.info("Training complete")
         return {
-            'uncensored_path': f"runs/train/{uncensored_experiment}",
-            'censored_path': f"runs/train/{censored_experiment}"
-        } 
+            'model_path': str(model_path),
+            'test_map50': test_map50
+        }
+    
+    def create_yaml(
+        self, 
+        yaml_path: Path,
+        train_data: str,
+        val_data: str,
+        test_data: str = 'uncensored',
+        test_only: bool = False
+    ) -> None:
+        """Create YAML configuration file for training or testing."""
+        import yaml
+        
+        def get_image_path(data_type: str, split: str) -> str:
+            if data_type == 'uncensored':
+                if split == 'train':
+                    return str(self.config.uncensored_train_images)
+                elif split == 'val':
+                    return str(self.config.uncensored_val_images)
+                else:  # test
+                    return str(self.config.uncensored_test_images)
+            elif data_type == 'censored-bbox':
+                if split == 'train':
+                    return str(self.config.censored_bbox_train_images)
+                elif split == 'val':
+                    return str(self.config.censored_bbox_val_images)
+                else:  # test - use uncensored test set
+                    return str(self.config.uncensored_test_images)
+            else:  # censored-blur
+                if split == 'train':
+                    return str(self.config.censored_blur_train_images)
+                elif split == 'val':
+                    return str(self.config.censored_blur_val_images)
+                else:  # test - use uncensored test set
+                    return str(self.config.uncensored_test_images)
+        
+        # create configuration - YOLOv8 requires train and val keys even for test-only configs
+        data_config = {
+            'train': get_image_path(train_data, 'train'),
+            'val': get_image_path(val_data, 'val'),
+            'test': get_image_path(test_data, 'test'),
+            'nc': len(self.config.classes),
+            'names': {i: name for i, name in enumerate(self.config.classes.keys())}
+        }
+        
+        # write configuration
+        with open(yaml_path, 'w') as f:
+            yaml.dump(data_config, f, default_flow_style=False, sort_keys=False)
+        
+        logger.info(f"YAML configuration written to {yaml_path}") 

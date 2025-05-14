@@ -2,7 +2,7 @@
 
 ## Visão Geral
 
-Este repositório contém um framework para comparar o desempenho de detecção de objetos do YOLOv8 em imagens censuradas versus não censuradas. O experimento treina modelos idênticos em ambos os conjuntos de dados e avalia seu desempenho para determinar como a censura facial afeta as capacidades de detecção.
+Este repositório contém um framework para comparar o desempenho de detecção de pessoas do YOLOv8-nano em imagens censuradas versus não censuradas. O experimento treina três modelos idênticos em diferentes variantes do dataset (não censurado, censurado com blur, censurado com retângulos pretos) e avalia seu desempenho para determinar como diferentes métodos de censura facial afetam as capacidades de detecção.
 
 ## Requisitos
 
@@ -18,76 +18,82 @@ source env/bin/activate
 pip install -r requirements.txt
 ```
 
-## Dataset
+## Estrutura do Dataset
 
-O experimento utiliza o dataset CrowdHuman com duas variantes:
-
-- Uncensored: Imagens originais
-- Censored: Imagens com regiões faciais borradas
-
-O dataset deve ser organizado na seguinte estrutura:
+O experimento utiliza o dataset CrowdHuman com três variantes:
 
 ```
-./crowdface/
-├── train_uncensored/     # Imagens de treinamento originais
-├── train_censored/       # Imagens de treinamento censuradas
-├── validation/           # Imagens de validação
-├── annotation_train.odgt # Anotações de treinamento
-└── annotation_val.odgt   # Anotações de validação
+crowdhuman/
+├── annotation.odgt         # Arquivo único de anotações
+├── uncensored/            # Imagens originais
+├── censored-blur/         # Imagens com faces borradas (Gaussian blur)
+└── censored-bbox/         # Imagens com faces cobertas por retângulos pretos
 ```
+
+O dataset é automaticamente dividido em:
+
+- 70% treino
+- 15% validação
+- 15% teste
+
+## Pipeline de Processamento
+
+1. **Preparação do Dataset**
+
+   - Leitura do arquivo de anotações único (annotation.odgt)
+   - Amostragem aleatória baseada no parâmetro `--fraction`
+   - Divisão em conjuntos de treino/validação/teste
+   - Conversão de anotações para formato YOLO
+   - Criação de symlinks para todas as variantes do dataset
+
+2. **Treinamento**
+   - Treina três modelos YOLOv8-nano:
+     1. Modelo não censurado (treino/validação em imagens originais)
+     2. Modelo censurado com blur (treino/validação em imagens com blur)
+     3. Modelo censurado com bbox (treino/validação em imagens com retângulos)
+   - Todos os modelos são testados no conjunto de teste não censurado
 
 ## Uso
 
-Execute o script de treinamento com parâmetros padrão:
-
 ```bash
-python train.py
+python train.py --data-path ./crowdhuman --fraction 0.01 --epochs 10
 ```
 
-### Parâmetros de Linha de Comando
+Parâmetros principais:
 
-| Parameter      | Description                    | Default       |
-| -------------- | ------------------------------ | ------------- |
-| `--data-path`  | Path to dataset directory      | `./crowdface` |
-| `--fraction`   | Dataset fraction to use (0-1)  | `0.01`        |
-| `--epochs`     | Number of training epochs      | `10`          |
-| `--batch-size` | Batch size for training        | `8`           |
-| `--img-size`   | Image size for training        | `640`         |
-| `--model`      | YOLOv8 model variant           | `yolov8n.pt`  |
-| `--workers`    | Number of data loading workers | `4`           |
-| `--verbose`    | Enable detailed logging        | `False`       |
+- `--data-path`: Caminho para o diretório do dataset
+- `--fraction`: Fração do dataset a ser usada (0-1)
+- `--epochs`: Número de épocas de treinamento
+- `--batch-size`: Tamanho do batch
+- `--img-size`: Tamanho das imagens
+- `--model`: Modelo YOLOv8 a ser usado (default: yolov8n.pt)
+- `--workers`: Número de workers
+- `--device`: Dispositivo (cuda, mps, cpu)
+- `--verbose`: Ativa logging detalhado
 
-Exemplo para treinamento com o dataset completo:
+## Resultados
 
-```bash
-python train.py --fraction 1.0 --epochs 50 --batch-size 16
-```
-
-## Design do Experimento
-
-O script:
-
-1. Processa anotações do dataset CrowdHuman
-2. Cria arquivos de labels compatíveis com YOLO
-3. Treina dois modelos YOLOv8 idênticos:
-   - Um nas imagens não censuradas
-   - Um nas imagens censuradas (idênticas exceto pelo borramento facial)
-4. Ambos os modelos usam o mesmo conjunto de validação e parâmetros de treinamento
-
-O parâmetro de fração permite execuções rápidas de prova de conceito em um subconjunto dos dados, facilitando o escalonamento para o conjunto de dados completo quando necessário.
-
-## Saídas
-
-Os resultados do treinamento são salvos em:
+Os resultados são salvos em:
 
 ```
-runs/train/
-├── uncensored_frac_*_*/  # Resultados do modelo não censurado
-└── censored_frac_*_*/    # Resultados do modelo censurado
+runs/
+├── train/
+│   ├── uncensored_*/        # Modelo treinado com dados não censurados
+│   ├── censored-blur_*/     # Modelo treinado com dados borrados
+│   └── censored-bbox_*/     # Modelo treinado com dados censurados com retângulos
+└── test/
+    ├── uncensored_*_test/   # Resultados de teste do modelo não censurado
+    ├── censored-blur_*_test/ # Resultados de teste do modelo com blur
+    └── censored-bbox_*_test/ # Resultados de teste do modelo com retângulos
 ```
 
-Cada diretório contém:
+## Citação
 
-- `weights/best.pt`: Melhores pesos do modelo
-- Métricas de treinamento e visualizações
-- Resultados de validação
+```bibtex
+@article{shao2018crowdhuman,
+    title={CrowdHuman: A Benchmark for Detecting Human in a Crowd},
+    author={Shao, Shuai and Zhao, Zijian and Li, Boxun and Xiao, Tete and Yu, Gang and Zhang, Xiangyu and Sun, Jian},
+    journal={arXiv preprint arXiv:1805.00123},
+    year={2018}
+}
+```

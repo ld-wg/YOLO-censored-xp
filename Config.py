@@ -25,30 +25,32 @@ class Args:
 
 
 class Config:
-    # configuration parameters for the YOLOv8 training pipeline
-    # dataset paths, training hyperparameters, and model settings.
+    # configuration for YOLOv8 training pipeline with new directory structure
     
     def __init__(self, args: Optional[Args] = None) -> None:
         # base paths
-        self.base_data_path: Path = Path('./crowdface').resolve()
+        self.base_data_path: Path = Path('./crowdhuman').resolve()
         
-        # annotation files
-        self.annotation_train: Path = self.base_data_path / 'annotation_train.odgt'
-        self.annotation_val: Path = self.base_data_path / 'annotation_val.odgt'
+        # single annotation file
+        self.annotation_file: Path = self.base_data_path / 'annotation.odgt'
         
-        # image directories
-        self.image_uncensored: Path = self.base_data_path / 'train_uncensored'
-        self.image_censored: Path = self.base_data_path / 'train_censored'
-        self.image_val: Path = self.base_data_path / 'validation'
-        self.image_test: Path = self.base_data_path / 'test'
+        # image directories for different versions
+        self.image_uncensored: Path = self.base_data_path / 'uncensored'
+        self.image_censored_blur: Path = self.base_data_path / 'censored-blur'
+        self.image_censored_bbox: Path = self.base_data_path / 'censored-bbox'
         
         # YOLO dataset directory (for prepared data)
-        self.yolo_dataset_dir: Path = Path('./crowdface_yolo').resolve()
+        self.yolo_dataset_dir: Path = Path('./crowdhuman_yolo').resolve()
         
         # dataset fraction for sampling
-        self.dataset_fraction: float = 0.01  # 1/100 of the dataset
+        self.dataset_fraction: float = 0.01  # 1% of the dataset
         
-        # classes
+        # train/val/test split ratios (must sum to 1.0)
+        self.train_ratio: float = 0.7
+        self.val_ratio: float = 0.15
+        self.test_ratio: float = 0.15
+        
+        # classes - now includes head bounding box
         self.classes: Dict[str, int] = {'person': 0, 'hbox': 1}
         
         # training parameters
@@ -56,16 +58,26 @@ class Config:
         self.img_size: int = 640
         self.batch_size: int = 8
         self.workers: int = 2
-        self.patience: int = 4
-        self.model_name: str = 'yolov8n.pt'  # smallest YOLOv8 model
+        self.patience: int = 7
+        self.model_name: str = 'yolov8n.pt'  # nano model
         
         # paths for prepared data - will be set in _setup_prepared_paths()
-        self.uncensored_images_dir: Path
-        self.uncensored_labels_dir: Path
-        self.censored_images_dir: Path
-        self.censored_labels_dir: Path
-        self.val_images_dir: Path
-        self.val_labels_dir: Path
+        self.uncensored_train_images: Path
+        self.uncensored_train_labels: Path
+        self.uncensored_val_images: Path
+        self.uncensored_val_labels: Path
+        self.uncensored_test_images: Path
+        self.uncensored_test_labels: Path
+        
+        self.censored_blur_train_images: Path
+        self.censored_blur_train_labels: Path
+        self.censored_blur_val_images: Path
+        self.censored_blur_val_labels: Path
+        
+        self.censored_bbox_train_images: Path
+        self.censored_bbox_train_labels: Path
+        self.censored_bbox_val_images: Path
+        self.censored_bbox_val_labels: Path
         
         # setup the prepared paths
         self._setup_prepared_paths()
@@ -76,29 +88,35 @@ class Config:
             
     # set up paths for prepared data based on configuration
     def _setup_prepared_paths(self) -> None:
-        # Uncensored data
-        self.uncensored_images_dir = self.yolo_dataset_dir / 'uncensored' / 'images' / 'train'
-        self.uncensored_labels_dir = self.yolo_dataset_dir / 'uncensored' / 'labels' / 'train'
+        # Uncensored data paths
+        self.uncensored_train_images = self.yolo_dataset_dir / 'uncensored' / 'images' / 'train'
+        self.uncensored_train_labels = self.yolo_dataset_dir / 'uncensored' / 'labels' / 'train'
+        self.uncensored_val_images = self.yolo_dataset_dir / 'uncensored' / 'images' / 'val'
+        self.uncensored_val_labels = self.yolo_dataset_dir / 'uncensored' / 'labels' / 'val'
+        self.uncensored_test_images = self.yolo_dataset_dir / 'uncensored' / 'images' / 'test'
+        self.uncensored_test_labels = self.yolo_dataset_dir / 'uncensored' / 'labels' / 'test'
         
-        # Censored data
-        self.censored_images_dir = self.yolo_dataset_dir / 'censored' / 'images' / 'train'
-        self.censored_labels_dir = self.yolo_dataset_dir / 'censored' / 'labels' / 'train'
+        # Censored-blur data paths
+        self.censored_blur_train_images = self.yolo_dataset_dir / 'censored-blur' / 'images' / 'train'
+        self.censored_blur_train_labels = self.yolo_dataset_dir / 'censored-blur' / 'labels' / 'train'
+        self.censored_blur_val_images = self.yolo_dataset_dir / 'censored-blur' / 'images' / 'val'
+        self.censored_blur_val_labels = self.yolo_dataset_dir / 'censored-blur' / 'labels' / 'val'
         
-        # Validation data (simplified)
-        self.val_images_dir = self.yolo_dataset_dir / 'validation' / 'images' / 'val'
-        self.val_labels_dir = self.yolo_dataset_dir / 'validation' / 'labels' / 'val'
+        # Censored-bbox data paths
+        self.censored_bbox_train_images = self.yolo_dataset_dir / 'censored-bbox' / 'images' / 'train'
+        self.censored_bbox_train_labels = self.yolo_dataset_dir / 'censored-bbox' / 'labels' / 'train'
+        self.censored_bbox_val_images = self.yolo_dataset_dir / 'censored-bbox' / 'images' / 'val'
+        self.censored_bbox_val_labels = self.yolo_dataset_dir / 'censored-bbox' / 'labels' / 'val'
     
     # update configuration from command line arguments
     def update_from_args(self, args: Args) -> None:
         if args.data_path is not None:
             self.base_data_path = Path(args.data_path).resolve()
-            # update annotation files and image directories
-            self.annotation_train = self.base_data_path / 'annotation_train.odgt'
-            self.annotation_val = self.base_data_path / 'annotation_val.odgt'
-            self.image_uncensored = self.base_data_path / 'train_uncensored'
-            self.image_censored = self.base_data_path / 'train_censored'
-            self.image_val = self.base_data_path / 'validation'
-            self.image_test = self.base_data_path / 'test'
+            # update paths
+            self.annotation_file = self.base_data_path / 'annotation.odgt'
+            self.image_uncensored = self.base_data_path / 'uncensored'
+            self.image_censored_blur = self.base_data_path / 'censored-blur'
+            self.image_censored_bbox = self.base_data_path / 'censored-bbox'
         
         if args.fraction is not None:
             self.dataset_fraction = args.fraction
@@ -134,6 +152,7 @@ class Config:
             f"  Dataset Fraction: {self.dataset_fraction} ({self.dataset_fraction*100:.1f}%)\n"
             f"  Base Path: {self.base_data_path}\n"
             f"  Classes: {list(self.classes.keys())}\n"
+            f"  Split Ratios: train={self.train_ratio}, val={self.val_ratio}, test={self.test_ratio}\n"
             f"  Epochs: {self.epochs}\n"
             f"  Batch Size: {self.batch_size}\n"
             f"  Image Size: {self.img_size}\n"
@@ -143,7 +162,7 @@ class Config:
 
 # parse command line arguments and return Args object
 def parse_arguments() -> Args:
-    parser = argparse.ArgumentParser(description='Train YOLOv8 on CrowdHuman dataset with censored/uncensored faces')
+    parser = argparse.ArgumentParser(description='Train YOLOv8 on CrowdHuman dataset with different censoring methods')
     
     # define arguments without defaults - Config will apply defaults
     parser.add_argument('--data-path', type=str, help='Base path to CrowdHuman dataset')

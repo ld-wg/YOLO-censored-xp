@@ -8,6 +8,7 @@ import yaml
 import random
 import shutil
 import logging
+import math
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any, Union
@@ -16,14 +17,14 @@ from Config import Config
 logger = logging.getLogger('crowdhuman_trainer')
 
 class DatasetPreparer:
-    # dataset preparation, including annotation conversion and symlink creation.
+    # dataset preparation, including annotation conversion and symlink creation
     
     def __init__(self, config: Config) -> None:
         self.config: Config = config
         self.image_extensions: Set[str] = {'.jpg', '.jpeg', '.png'}
         
     def clean_dataset_directory(self) -> None:
-        # clean existing dataset directory to ensure a clean state.
+        # clean existing dataset directory to ensure a clean state
         if os.path.exists(self.config.yolo_dataset_dir):
             logger.info(f"Removing existing dataset directory: {self.config.yolo_dataset_dir}")
             try:
@@ -32,19 +33,38 @@ class DatasetPreparer:
             except Exception as e:
                 logger.warning(f"Could not remove directory: {e}")
                 
-        # create necessary directories
+        # create necessary directories for all data variants
         dirs_to_create = [
-            self.config.uncensored_images_dir, self.config.uncensored_labels_dir,
-            self.config.censored_images_dir, self.config.censored_labels_dir,
-            self.config.val_images_dir, self.config.val_labels_dir
+            # Uncensored
+            self.config.uncensored_train_images, self.config.uncensored_train_labels,
+            self.config.uncensored_val_images, self.config.uncensored_val_labels,
+            self.config.uncensored_test_images, self.config.uncensored_test_labels,
+            # Censored-blur
+            self.config.censored_blur_train_images, self.config.censored_blur_train_labels,
+            self.config.censored_blur_val_images, self.config.censored_blur_val_labels,
+            # Censored-bbox
+            self.config.censored_bbox_train_images, self.config.censored_bbox_train_labels,
+            self.config.censored_bbox_val_images, self.config.censored_bbox_val_labels
         ]
         
         for dir_path in dirs_to_create:
             os.makedirs(dir_path, exist_ok=True)
             logger.debug(f"Created directory: {dir_path}")
+            
+        # Verify that source image directories exist
+        for img_dir in [self.config.image_uncensored, self.config.image_censored_blur, self.config.image_censored_bbox]:
+            if not os.path.exists(img_dir):
+                logger.error(f"Source image directory does not exist: {img_dir}")
+                logger.error(f"Make sure that the base_data_path '{self.config.base_data_path}' contains subdirectories:")
+                logger.error(f"  - uncensored/")
+                logger.error(f"  - censored-blur/")
+                logger.error(f"  - censored-bbox/")
     
     def validate_dataset_pairings(self, image_dir: Path, label_dir: Path) -> bool:
+        # validate image-label pairings
         valid = True
+        missing_labels = []
+        missing_images = []
         
         # Check images -> labels
         for img_file in os.listdir(image_dir):
@@ -52,7 +72,7 @@ class DatasetPreparer:
                 base_name = os.path.splitext(img_file)[0]
                 label_file = os.path.join(label_dir, f"{base_name}.txt")
                 if not os.path.exists(label_file):
-                    logger.warning(f"Image {img_file} has no corresponding label file")
+                    missing_labels.append(img_file)
                     valid = False
         
         # Check labels -> images
@@ -64,178 +84,230 @@ class DatasetPreparer:
                     for ext in self.image_extensions
                 )
                 if not img_exists:
-                    logger.warning(f"Label {label_file} has no corresponding image file (checked extensions: {self.image_extensions})")
+                    missing_images.append(label_file)
                     valid = False
         
+        # Log summary instead of individual warnings
+        if missing_labels:
+            logger.warning(f"Found {len(missing_labels)} images without labels in {image_dir}")
+            logger.debug(f"Images without labels: {', '.join(missing_labels)}")
+            
+        if missing_images:
+            logger.warning(f"Found {len(missing_images)} labels without images in {label_dir}")
+            logger.debug(f"Labels without images: {', '.join(missing_images)}")
+            
+        if valid:
+            logger.info(f"All images in {image_dir} have corresponding labels")
+            
         return valid
     
     def process_dataset(self) -> Dict[str, int]:
-        # process the entire dataset, creating labels and symlinks.
+        # process the entire dataset, creating labels and symlinks
         logger.info("Starting dataset preparation")
         
         # clean the dataset directory first
         self.clean_dataset_directory()
         
-        # create labels
-        uncensored_count = self.create_labels(
-            self.config.annotation_train, 
-            self.config.image_uncensored,
-            self.config.uncensored_labels_dir, 
-            apply_fraction=True
-        )
-        
-        censored_count = self.create_labels(
-            self.config.annotation_train, 
-            self.config.image_censored,
-            self.config.censored_labels_dir, 
-            apply_fraction=True
-        )
-        
-        val_count = self.create_labels(
-            self.config.annotation_val, 
-            self.config.image_val,
-            self.config.val_labels_dir, 
-            apply_fraction=True
-        )
-        
-        # create symlinks for images that have labels
-        self.create_image_symlinks(self.config.image_uncensored, self.config.uncensored_images_dir, self.config.uncensored_labels_dir)
-        self.create_image_symlinks(self.config.image_censored, self.config.censored_images_dir, self.config.censored_labels_dir)
-        self.create_image_symlinks(self.config.image_val, self.config.val_images_dir, self.config.val_labels_dir)
-
-        # validate dataset pairings AFTER symlinks are created
-        logger.info("Validating final dataset pairings in prepared directories...")
-        valid = True
-        valid &= self.validate_dataset_pairings(self.config.uncensored_images_dir, self.config.uncensored_labels_dir)
-        valid &= self.validate_dataset_pairings(self.config.censored_images_dir, self.config.censored_labels_dir)
-        valid &= self.validate_dataset_pairings(self.config.val_images_dir, self.config.val_labels_dir)
-        
-        if not valid:
-            logger.error("Dataset validation failed - mismatches between images and labels found in prepared directories")
+        # read and sample annotations
+        try:
+            with open(self.config.annotation_file, 'r') as f:
+                all_lines = f.readlines()
+            
+            total_annotations = len(all_lines)
+            logger.info(f"Total annotations in source file: {total_annotations}")
+            
+            if self.config.dataset_fraction < 1.0:
+                random.seed(42)  # ensure consistent sampling
+                random.shuffle(all_lines)
+                sample_size = max(1, int(total_annotations * self.config.dataset_fraction))
+                all_lines = all_lines[:sample_size]
+                logger.info(f"Sampled {len(all_lines)} annotations ({self.config.dataset_fraction:.2%})")
+            
+            # split data into train/val/test
+            random.seed(42)  # ensure consistent splits
+            random.shuffle(all_lines)
+            
+            train_size = int(len(all_lines) * self.config.train_ratio)
+            val_size = int(len(all_lines) * self.config.val_ratio)
+            
+            train_lines = all_lines[:train_size]
+            val_lines = all_lines[train_size:train_size + val_size]
+            test_lines = all_lines[train_size + val_size:]
+            
+            logger.info(f"Split sizes: train={len(train_lines)}, val={len(val_lines)}, test={len(test_lines)}")
+            
+            # process each split
+            train_count = self._create_labels_from_lines(
+                train_lines,
+                self.config.image_uncensored,
+                self.config.uncensored_train_labels,
+                "train"
+            )
+            
+            val_count = self._create_labels_from_lines(
+                val_lines,
+                self.config.image_uncensored,
+                self.config.uncensored_val_labels,
+                "validation"
+            )
+            
+            test_count = self._create_labels_from_lines(
+                test_lines,
+                self.config.image_uncensored,
+                self.config.uncensored_test_labels,
+                "test"
+            )
+            
+            # create symlinks for all variants
+            variants = [
+                (self.config.image_uncensored, 'uncensored'),
+                (self.config.image_censored_blur, 'censored-blur'),
+                (self.config.image_censored_bbox, 'censored-bbox')
+            ]
+            
+            for src_dir, variant_name in variants:
+                # Skip if source directory doesn't exist
+                if not os.path.exists(src_dir):
+                    logger.warning(f"Source directory not found: {src_dir}")
+                    continue
+                    
+                # Create symlinks for train and val
+                for split in ['train', 'val']:
+                    target_dir = getattr(self.config, f"{variant_name.replace('-', '_')}_{split}_images")
+                    label_dir = getattr(self.config, f"uncensored_{split}_labels")  # always use uncensored labels
+                    
+                    success = self.create_image_symlinks(src_dir, target_dir, label_dir)
+                    if not success:
+                        logger.error(f"Failed to create symlinks for {variant_name} {split} set")
+                        return {'train_count': 0, 'val_count': 0, 'test_count': 0}
+                
+                # Only create test symlinks for uncensored variant
+                if variant_name == 'uncensored':
+                    success = self.create_image_symlinks(
+                        src_dir,
+                        self.config.uncensored_test_images,
+                        self.config.uncensored_test_labels
+                    )
+                    if not success:
+                        logger.error("Failed to create symlinks for test set")
+                        return {'train_count': 0, 'val_count': 0, 'test_count': 0}
+            
+            # validate dataset pairings
+            logger.info("Validating final dataset pairings...")
+            valid = True
+            
+            # Validate all splits for each variant
+            for variant_name in ['uncensored', 'censored_blur', 'censored_bbox']:
+                for split in ['train', 'val']:
+                    img_dir = getattr(self.config, f"{variant_name}_{split}_images")
+                    label_dir = getattr(self.config, f"uncensored_{split}_labels")  # always use uncensored labels
+                    valid &= self.validate_dataset_pairings(img_dir, label_dir)
+                    
+            # Validate test set (uncensored only)
+            valid &= self.validate_dataset_pairings(
+                self.config.uncensored_test_images,
+                self.config.uncensored_test_labels
+            )
+            
+            if not valid:
+                logger.error("Dataset validation failed - mismatches between images and labels found")
+                return {'train_count': 0, 'val_count': 0, 'test_count': 0}
+            
+            logger.info("Dataset Processing Summary:")
+            logger.info(f"  Training samples: {train_count}")
+            logger.info(f"  Validation samples: {val_count}")
+            logger.info(f"  Test samples: {test_count}")
+            
             return {
-                'uncensored_count': 0,
-                'censored_count': 0,
-                'val_count': 0
+                'train_count': train_count,
+                'val_count': val_count,
+                'test_count': test_count
             }
-        
-        # log summary of processed labels
-        logger.info("Label Processing Summary:")
-        logger.info(f"  Uncensored Training: {uncensored_count} labels created")
-        logger.info(f"  Censored Training:   {censored_count} labels created")
-        logger.info(f"  Validation:          {val_count} labels created")
-        
-        return {
-            'uncensored_count': uncensored_count,
-            'censored_count': censored_count,
-            'val_count': val_count
-        }
+            
+        except FileNotFoundError:
+            logger.error(f"Annotation file not found: {self.config.annotation_file}")
+            return {'train_count': 0, 'val_count': 0, 'test_count': 0}
     
-    def create_labels(self, annotation_file: Path, image_dir: Path, label_dir: Path, apply_fraction: bool = False) -> int:
-        # convert ODGT annotations to YOLO format and save as label files.
-        logger.info(f"Creating labels: {annotation_file} -> {label_dir}")
+    def _create_labels_from_lines(self, annotation_lines: List[str], image_dir: Path, label_dir: Path, split_name: str) -> int:
+        # convert ODGT annotations to YOLO format and save as label files
+        logger.info(f"Creating labels for {split_name}: {len(annotation_lines)} annotations -> {label_dir}")
         
-        # ensure the label directory exists
         os.makedirs(label_dir, exist_ok=True)
-        
-        # check if the image directory exists
         if not os.path.exists(image_dir):
             logger.error(f"Image directory not found: {image_dir}")
             return 0
         
-        # map (image ids --> file paths)
         image_id_to_path: Dict[str, str] = {}
         for file in os.listdir(image_dir):
             file_base, ext = os.path.splitext(file)
             if ext.lower() in self.image_extensions:
                 image_id_to_path[file_base] = os.path.join(image_dir, file)
         
-        # load annotations
-        try:
-            with open(annotation_file, 'r') as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            logger.error(f"Annotation file not found: {annotation_file}")
-            return 0
-        
-        logger.info(f"Total annotations in file: {len(lines)}")
-        
-        # apply sampling fraction if requested (regardless of train/val)
-        if apply_fraction and self.config.dataset_fraction < 1.0:
-            # use fixed seed for consistent sampling across datasets
-            random.seed(42)
-            random.shuffle(lines)
-            sample_size = max(1, int(len(lines) * self.config.dataset_fraction))
-            logger.info(f"Sampling {sample_size} annotations ({self.config.dataset_fraction:.2%} of {len(lines)})")
-            lines = lines[:sample_size]  # take the first N after shuffling
-        
-        # process annotations
         processed_count = 0
         skipped_image_read = 0
         skipped_no_boxes = 0
+        min_pixel_dim = 2
         
-        for line in tqdm(lines, desc=f"Processing {os.path.basename(annotation_file)}"):
+        for line in tqdm(annotation_lines, desc=f"Processing {split_name} annotations"):
             try:
                 data = json.loads(line.strip())
             except json.JSONDecodeError:
+                logger.warning(f"Skipping invalid JSON line in {split_name}")
                 continue
                 
             image_id = data.get('ID')
             if not image_id:
+                logger.warning(f"Skipping annotation line with no ID in {split_name}")
                 continue
             
-            # find the image file
-            image_path = None
+            image_path_str = None
             if image_id in image_id_to_path:
-                image_path = image_id_to_path[image_id]
+                image_path_str = image_id_to_path[image_id]
             else:
-                # try with different extensions
-                for ext in self.image_extensions:
-                    possible_path = os.path.join(image_dir, f"{image_id}{ext}")
+                for ext_ in self.image_extensions:
+                    possible_path = os.path.join(image_dir, f"{image_id}{ext_}")
                     if os.path.exists(possible_path):
-                        image_path = possible_path
-                        image_id_to_path[image_id] = possible_path
+                        image_path_str = str(possible_path)
+                        image_id_to_path[image_id] = image_path_str
                         break
             
-            if not image_path or not os.path.exists(image_path):
+            if not image_path_str or not os.path.exists(image_path_str):
+                logger.debug(f"Image ID {image_id} not found in {image_dir}")
                 continue
                 
             label_path = os.path.join(label_dir, f"{image_id}.txt")
             
-            # get image dimensions for normalization
-            img_size = self.get_image_size(image_path)
+            img_size = self.get_image_size(image_path_str)
             if img_size is None:
+                logger.warning(f"Could not read image size for {image_path_str}")
                 skipped_image_read += 1
                 continue
             img_w, img_h = img_size
             
-            # process bounding boxes
             yolo_labels = []
             gtboxes = data.get('gtboxes', [])
             
             if not gtboxes:
+                logger.debug(f"Image {image_id} had no gtboxes in annotation")
                 skipped_no_boxes += 1
-                with open(label_path, 'w') as lf:
-                    pass  # write empty file for images with no boxes
                 continue
-            
+
+            valid_boxes_for_image = False
             for gtbox in gtboxes:
                 tag = gtbox.get('tag')
-                # only include 'person' tags for processing vbox and hbox
-                if tag != 'person':
+                if tag != 'person': 
                     continue
 
-                # skip ignored boxes
                 extra = gtbox.get('extra', {})
                 if extra.get('ignore', 0) == 1:
                     continue
-
-                # process visible box (vbox) for class 'person' (ID 0)
+                
+                # process visible box (vbox) - person detection
                 vbox = gtbox.get('vbox')
                 if vbox and len(vbox) == 4:
                     try:
                         vbox_float = [float(c) for c in vbox]
-                        if vbox_float[2] > 0 and vbox_float[3] > 0: # Check width/height > 0
-                            # clamp to image bounds
+                        if vbox_float[2] > 0 and vbox_float[3] > 0:
                             x_v, y_v, w_v, h_v = vbox_float
                             x1_v = max(0.0, x_v)
                             y1_v = max(0.0, y_v)
@@ -243,24 +315,27 @@ class DatasetPreparer:
                             y2_v = min(float(img_h), y_v + h_v)
                             clamped_w_v = x2_v - x1_v
                             clamped_h_v = y2_v - y1_v
-
-                            if clamped_w_v > 0 and clamped_h_v > 0:
+                            
+                            if clamped_w_v >= min_pixel_dim and clamped_h_v >= min_pixel_dim:
                                 clamped_vbox = [x1_v, y1_v, clamped_w_v, clamped_h_v]
                                 yolo_vbox = self.convert_to_yolo(clamped_vbox, img_w, img_h)
-                                person_class_id = self.config.classes.get('person')
-                                if person_class_id is not None:
-                                    yolo_labels.append(f"{person_class_id} {' '.join(map(str, yolo_vbox))}")
-
+                                
+                                if any(math.isnan(c) or math.isinf(c) for c in yolo_vbox):
+                                    logger.debug(f"Skipping vbox for {image_id} due to NaN/Inf")
+                                else:
+                                    person_class_id = self.config.classes.get('person')
+                                    if person_class_id is not None:
+                                        yolo_labels.append(f"{person_class_id} {' '.join(map(str, yolo_vbox))}")
+                                        valid_boxes_for_image = True
                     except (ValueError, TypeError) as e:
-                         logger.debug(f"Skipping vbox for image {image_id} due to processing error: {e}")
-
-                # process head box (hbox) for class 'hbox' (ID 1)
+                        logger.debug(f"Skipping vbox for {image_id} due to: {e}")
+                
+                # process head box (hbox) - head detection
                 hbox = gtbox.get('hbox')
                 if hbox and len(hbox) == 4:
                     try:
                         hbox_float = [float(c) for c in hbox]
-                        if hbox_float[2] > 0 and hbox_float[3] > 0: # Check width/height > 0
-                            # clamp to image bounds
+                        if hbox_float[2] > 0 and hbox_float[3] > 0:
                             x_h, y_h, w_h, h_h = hbox_float
                             x1_h = max(0.0, x_h)
                             y1_h = max(0.0, y_h)
@@ -268,44 +343,49 @@ class DatasetPreparer:
                             y2_h = min(float(img_h), y_h + h_h)
                             clamped_w_h = x2_h - x1_h
                             clamped_h_h = y2_h - y1_h
-
-                            if clamped_w_h > 0 and clamped_h_h > 0:
+                            
+                            if clamped_w_h >= min_pixel_dim and clamped_h_h >= min_pixel_dim:
                                 clamped_hbox = [x1_h, y1_h, clamped_w_h, clamped_h_h]
                                 yolo_hbox = self.convert_to_yolo(clamped_hbox, img_w, img_h)
-                                hbox_class_id = self.config.classes.get('hbox')
-                                if hbox_class_id is not None:
-                                     yolo_labels.append(f"{hbox_class_id} {' '.join(map(str, yolo_hbox))}")
-
+                                
+                                if any(math.isnan(c) or math.isinf(c) for c in yolo_hbox):
+                                    logger.debug(f"Skipping hbox for {image_id} due to NaN/Inf")
+                                else:
+                                    hbox_class_id = self.config.classes.get('hbox')
+                                    if hbox_class_id is not None:
+                                        yolo_labels.append(f"{hbox_class_id} {' '.join(map(str, yolo_hbox))}")
+                                        valid_boxes_for_image = True
                     except (ValueError, TypeError) as e:
-                         logger.debug(f"Skipping hbox for image {image_id} due to processing error: {e}")
-
-            # write labels if any were generated for this image
-            if yolo_labels:
-                # Only count as processed if we actually wrote non-empty labels
+                        logger.debug(f"Skipping hbox for {image_id} due to: {e}")
+            
+            if yolo_labels and valid_boxes_for_image:
                 with open(label_path, 'w') as lf:
                     lf.write("\n".join(yolo_labels))
                 processed_count += 1
-            elif os.path.exists(image_path): # If image exists but had no valid boxes
-                 # Write empty file if no valid boxes found for this image ID,
-                 # but only if the image file actually exists.
-                 # This prevents creating labels for missing images.
-                 with open(label_path, 'w') as lf:
-                     pass # write empty file
-                 skipped_no_boxes += 1 # Increment no boxes count
-        
-        logger.info(f"Finished processing {os.path.basename(annotation_file)}")
+            else: 
+                if os.path.exists(image_path_str):
+                    if not gtboxes: 
+                        pass 
+                    elif gtboxes and not valid_boxes_for_image: 
+                        logger.debug(f"Image {image_id} had gtboxes, but none were valid after processing")
+                        skipped_no_boxes += 1 
+
+        logger.info(f"Finished processing {split_name} annotations:")
         logger.info(f"  Labels written: {processed_count}")
         logger.info(f"  Skipped (image read error): {skipped_image_read}")
         logger.info(f"  Skipped (no valid boxes): {skipped_no_boxes}")
-        
         return processed_count
-    
+
     def create_image_symlinks(self, src_dir: Path, dest_dir: Path, label_dir: Path) -> bool:
-        # create symlinks from source to destination directory only for images with labels.
+        # create symlinks from source to destination directory only for images with labels
         logger.info(f"Creating symlinks: {src_dir} -> {dest_dir} (based on labels in {label_dir})")
         
-        if not os.path.exists(src_dir) or not os.path.exists(label_dir):
-            logger.error(f"Source or label directory not found")
+        if not os.path.exists(src_dir):
+            logger.error(f"Source directory not found: {src_dir}")
+            return False
+        
+        if not os.path.exists(label_dir):
+            logger.error(f"Label directory not found: {label_dir}")
             return False
         
         # get list of image IDs that have labels
@@ -333,6 +413,8 @@ class DatasetPreparer:
         
         # create symlinks
         count = 0
+        missing_files = []
+        
         for image_id in label_files:
             found = False
             for ext in self.image_extensions:
@@ -341,14 +423,15 @@ class DatasetPreparer:
                     dest_path = os.path.join(dest_dir, f"{image_id}{ext}")
                     
                     try:
-                        # try relative symlink first, then absolute
+                        # try relative symlink first
                         rel_path = os.path.relpath(src_path, os.path.dirname(dest_path))
                         os.symlink(rel_path, dest_path)
                         count += 1
                         found = True
                         break
-                    except (OSError, ValueError):
+                    except (OSError, ValueError) as e:
                         try:
+                            # try absolute path if relative fails
                             os.symlink(os.path.abspath(src_path), dest_path)
                             count += 1
                             found = True
@@ -357,13 +440,39 @@ class DatasetPreparer:
                             logger.warning(f"Failed to create symlink for {image_id}: {e}")
             
             if not found:
-                logger.debug(f"Could not find image for label {image_id}")
+                missing_files.append(image_id)
         
-        logger.info(f"Created {count} symlinks out of {len(label_files)} labels")
+        if missing_files:
+            logger.warning(f"Could not find {len(missing_files)} images in source directory")
+            if len(missing_files) <= 10:  # Only show a few to avoid log spam
+                logger.warning(f"Missing image IDs: {', '.join(missing_files[:10])}")
+            else:
+                logger.warning(f"First 10 missing image IDs: {', '.join(missing_files[:10])}...")
+        
+        success_rate = count / len(label_files) if label_files else 0
+        logger.info(f"Created {count} symlinks out of {len(label_files)} labels ({success_rate:.1%})")
+        
+        # Also copy the label files to ensure they're available in the corresponding directory
+        # This ensures censored variants have their own copies of the label files
+        dest_label_dir = Path(str(dest_dir).replace('/images/', '/labels/'))
+        os.makedirs(dest_label_dir, exist_ok=True)
+        
+        # Only copy if source and destination are different
+        if str(label_dir) != str(dest_label_dir):
+            logger.info(f"Copying label files to {dest_label_dir}")
+            for label_file in os.listdir(label_dir):
+                if label_file.endswith('.txt'):
+                    src_label = os.path.join(label_dir, label_file)
+                    dest_label = os.path.join(dest_label_dir, label_file)
+                    try:
+                        shutil.copy2(src_label, dest_label)
+                    except Exception as e:
+                        logger.warning(f"Failed to copy label file {label_file}: {e}")
+        
         return count > 0
     
     def get_image_size(self, image_path: str) -> Optional[Tuple[int, int]]:
-        # get image dimensions using OpenCV.
+        # get image dimensions using OpenCV
         try:
             import cv2
             img = cv2.imread(str(image_path))
@@ -374,7 +483,7 @@ class DatasetPreparer:
             return None
     
     def convert_to_yolo(self, box: List[float], img_w: int, img_h: int) -> Tuple[float, float, float, float]:
-        # convert [x, y, w, h] to YOLO format [x_center_norm, y_center_norm, width_norm, height_norm].
+        # convert [x, y, w, h] to YOLO format [x_center_norm, y_center_norm, width_norm, height_norm]
         x, y, w, h = box
         x_center = x + w / 2
         y_center = y + h / 2
@@ -385,37 +494,3 @@ class DatasetPreparer:
         height_norm = h / img_h
         
         return x_center_norm, y_center_norm, width_norm, height_norm
-    
-    def create_yaml(self, yaml_path: Path, run_type: str) -> Dict[str, Any]:
-        # create YAML configuration file for training.
-        logger.info(f"Creating YAML configuration for {run_type}")
-        
-        if run_type == 'uncensored':
-            train_dir = self.config.uncensored_images_dir
-        elif run_type == 'censored':
-            train_dir = self.config.censored_images_dir
-        else:
-            raise ValueError(f"Invalid run_type: {run_type}")
-        
-        # get absolute paths
-        train_images_path = os.path.abspath(train_dir)
-        val_images_path = os.path.abspath(self.config.val_images_dir)
-        
-        # verify paths
-        logger.debug(f"Train images path: {train_images_path} (exists: {os.path.exists(train_images_path)})")
-        logger.debug(f"Val images path: {val_images_path} (exists: {os.path.exists(val_images_path)})")
-        
-        # create configuration
-        data_config = {
-            'train': train_images_path,
-            'val': val_images_path,
-            'nc': len(self.config.classes),
-            'names': {i: name for i, name in enumerate(self.config.classes.keys())}
-        }
-        
-        # write configuration
-        with open(yaml_path, 'w') as f:
-            yaml.dump(data_config, f, default_flow_style=False, sort_keys=False)
-        
-        logger.info(f"YAML configuration written to {yaml_path}")
-        return data_config
